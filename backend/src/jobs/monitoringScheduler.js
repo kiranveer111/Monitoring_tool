@@ -1,183 +1,181 @@
-    // backend/src/jobs/monitoringScheduler.js
-    const cron = require('node-cron');
-    const { getDB } = require('../db/connection');
-    const apiMonitorService = require('../services/apiMonitorService');
-    const certMonitorService = require('../services/certMonitorService');
-    const notificationService = require('../services/notificationService');
-    const logger = require('../utils/logger');
-    const config = require('../config');
+// backend/src/jobs/monitoringScheduler.js
+const cron = require('node-cron');
+const { getDB } = require('../db/connection');
+const apiMonitorService = require('../services/apiMonitorService');
+const certMonitorService = require('../services/certMonitorService');
+const notificationService = require('../services/notificationService');
+const logger = require('../utils/logger');
+const config = require('../config');
 
-    // Store active cron tasks to manage them
-    let apiMonitorTask = null;
-    let certMonitorTask = null;
+// Store scheduled tasks to stop them later
+const scheduledTasks = new Map(); // Map to store cron tasks by URL ID
 
-    /**
-     * Starts the scheduled monitoring tasks.
-     * This function should be called once during application startup.
-     */
-    const start = () => {
-        const db = getDB();
+/**
+ * Starts the main scheduled monitoring tasks for all active URLs.
+ * This should be called once during application startup.
+ */
+const start = async () => {
+    const db = getDB();
 
-        // Schedule API monitoring for all active 'API' type URLs
-        // Runs every 1 minute for all active APIs.
-        apiMonitorTask = cron.schedule('*/1 * * * *', async () => {
-            logger.info('Running scheduled API monitoring check...');
+    // Clear any existing tasks in case of restart without full process termination
+    scheduledTasks.forEach(task => task.stop());
+    scheduledTasks.clear();
+    logger.info('Cleared existing scheduled tasks upon scheduler start.');
+
+    // Load all active URLs from the database at startup and schedule them
+    try {
+        const [urls] = await db.execute(
+            `SELECT
+                u.id, u.user_id, u.name, u.url, u.type, u.monitoring_interval_minutes, u.is_active,
+                pc.host AS proxy_host, pc.port AS proxy_port, pc.protocol AS proxy_protocol,
+                pc.username AS proxy_username, pc.password AS proxy_password, pc.enabled AS proxy_enabled
+            FROM Urls u
+            LEFT JOIN ProxyConfigs pc ON u.proxy_config_id = pc.id
+            WHERE u.is_active = TRUE`
+        );
+
+        urls.forEach(urlEntry => {
+            scheduleMonitor(urlEntry); // Schedule each active URL
+        });
+        logger.info(`Scheduled ${urls.length} initial active URLs.`);
+    } catch (error) {
+        logger.error(`Error loading initial URLs for scheduling: ${error.message}`);
+        console.error(`Error loading initial URLs for scheduling:`, error);
+    }
+
+    // It's generally better to rely on individual scheduling for precision.
+    // General API and Certificate checks are good for initial run or fallback,
+    // but the per-URL cron should be the primary mechanism.
+    // If you explicitly want a general API check, keep it. Otherwise, rely on per-URL.
+
+    // Example of a general recurring task (e.g., re-sync or health checks)
+    // Removed general API and Cert checks that could interfere with specific per-URL scheduling
+    // and rely on `scheduleMonitor` for initial and updated scheduling.
+    // If you need a general check, define it here, but ensure it doesn't conflict
+    // with the precise per-URL monitoring.
+    logger.info('Monitoring scheduler started. Individual URL monitoring will be managed by their respective cron jobs.');
+};
+
+/**
+ * Schedules a monitoring task for a single URL.
+ * Each URL gets its own cron job based on its monitoring interval.
+ * @param {object} urlEntry - The URL object from the database with all details including proxy.
+ */
+const scheduleMonitor = (urlEntry) => {
+    const { id, user_id, url, name, type, monitoring_interval_minutes, is_active } = urlEntry;
+    const intervalCron = `*/${monitoring_interval_minutes} * * * *`; // e.g., "*/5 * * * *" for every 5 minutes
+
+    // Stop any existing task for this URL before re-scheduling
+    stopMonitor(id); // Ensure we stop existing tasks for this URL ID
+
+    if (!is_active) {
+        logger.info(`Monitoring for URL ID ${id} (${name}) is inactive. Not scheduling.`);
+        return;
+    }
+
+    // Determine the task key based on URL type
+    const taskKey = `url-${id}`; // Use a single key for a URL, as it might switch types
+
+    // Define the async function to execute for the cron job
+    const monitorJob = async () => {
+        logger.info(`Running scheduled ${type} check for: ${name} (URL ID: ${id})`);
+        try {
+            if (type === 'API') {
+                const proxyConfig = urlEntry.proxy_host ? {
+                    host: urlEntry.proxy_host,
+                    port: urlEntry.proxy_port,
+                    protocol: urlEntry.proxy_protocol,
+                    username: urlEntry.proxy_username,
+                    password: urlEntry.proxy_password,
+                    enabled: urlEntry.proxy_enabled
+                } : null;
+                const result = await apiMonitorService.checkApiUptime(id, url, proxyConfig);
+                if (result.status === 'down') {
+                    await notificationService.sendApiDownAlert(user_id, url, result.error);
+                }
+            } else if (type === 'DOMAIN') {
+                // Pass the full urlEntry object to certMonitorService.checkCertStatus
+                const result = await certMonitorService.checkCertStatus(urlEntry);
+                if (result.status === 'expired' || (result.status === 'warning' && result.daysRemaining <= config.alerting.certWarningDays)) {
+                    await notificationService.sendCertificateExpiryAlert(user_id, url, result.expiryDate, result.daysRemaining);
+                }
+            }
+        } catch (error) {
+            logger.error(`Error during scheduled monitoring for URL ID ${id} (${name}): ${error.message}`);
+            console.error(`Error during scheduled monitoring for URL ID ${id} (${name}):`, error);
+            // Optionally, update URL status to 'down' if the monitoring job itself fails unexpectedly
+            const db = getDB();
             try {
-                // Fetch all active URLs that are of type 'API' and their associated proxy configs
-                const [urls] = await db.execute(
-                    `SELECT
-                        u.id,
-                        u.user_id,
-                        u.name,
-                        u.url,
-                        u.type,
-                        u.monitoring_interval_minutes,
-                        pc.host AS proxy_host,
-                        pc.port AS proxy_port,
-                        pc.protocol AS proxy_protocol,
-                        pc.username AS proxy_username,
-                        pc.password AS proxy_password,
-                        pc.enabled AS proxy_enabled
-                    FROM Urls u
-                    LEFT JOIN ProxyConfigs pc ON u.proxy_config_id = pc.id
-                    WHERE u.is_active = TRUE AND u.type = 'API'`
+                await db.execute(
+                    `UPDATE Urls SET last_status = 'down', last_checked_at = NOW(), last_error = ? WHERE id = ?`,
+                    [`Internal monitoring error: ${error.message}`, id]
                 );
-
-                // Iterate over each API URL and perform the check
-                for (const urlEntry of urls) {
-                    // Only check if enough time has passed since last check (to respect monitoring_interval_minutes)
-                    // This cron job acts as a general trigger; precise timing is handled here.
-                    // For now, we'll run all active APIs on this fixed schedule.
-                    // For per-URL intervals, you would store and manage individual cron.schedule tasks for each URL.
-                    const now = new Date();
-                    const lastCheckedAt = urlEntry.last_checked_at ? new Date(urlEntry.last_checked_at) : new Date(0);
-                    const intervalMinutes = urlEntry.monitoring_interval_minutes;
-
-                    const minutesSinceLastCheck = (now.getTime() - lastCheckedAt.getTime()) / (1000 * 60);
-
-                    if (minutesSinceLastCheck >= intervalMinutes) {
-                        logger.debug(`Checking API: ${urlEntry.name} (${urlEntry.url}) (URL ID: ${urlEntry.id})`);
-                        await apiMonitorService.checkApiUrlStatus(urlEntry);
-                    } else {
-                        logger.debug(`Skipping API ${urlEntry.name} (ID: ${urlEntry.id}). Next check in ${intervalMinutes - minutesSinceLastCheck.toFixed(0)} mins.`);
-                    }
-                }
-                logger.info('API monitoring check completed.');
-            } catch (error) {
-                logger.error(`Error during API monitoring job: ${error.message}`);
+            } catch (dbUpdateError) {
+                logger.error(`Failed to update URL status after internal monitoring error for ID ${id}: ${dbUpdateError.message}`);
             }
-        }, {
-            scheduled: true,
-            timezone: "Asia/Kolkata" // Set your desired timezone
-        });
-
-        // Schedule Certificate monitoring for all active 'DOMAIN' type URLs
-        // Runs once a day at 2 AM (or the time configured in config.js if applicable)
-        certMonitorTask = cron.schedule('0 2 * * *', async () => { // 2 AM every day
-            logger.info('Running scheduled Certificate monitoring check...');
-            try {
-                // Fetch all active URLs that are of type 'DOMAIN'
-                const [urls] = await db.execute(`SELECT id, user_id, name, url, type FROM Urls WHERE is_active = TRUE AND type = 'DOMAIN'`);
-
-                // Iterate over each domain URL and check its certificate
-                for (const urlEntry of urls) {
-                    logger.debug(`Checking certificate for: ${urlEntry.name} (${urlEntry.url}) (URL ID: ${urlEntry.id})`);
-                    const result = await certMonitorService.checkCertStatus(urlEntry); // Pass urlEntry object
-
-                    // If certificate is expired or in warning state, trigger an alert
-                    // The `result` object from `checkCertStatus` now contains expiryDate and daysRemaining
-                    if (result.status === 'expired' || (result.status === 'warning' && result.daysRemaining <= config.alerting.certWarningDays)) {
-                        await notificationService.sendCertificateExpiryAlert(urlEntry.user_id, urlEntry.url, result.expiryDate, result.daysRemaining, result.status);
-                    }
-                }
-                logger.info('Certificate monitoring check completed.');
-            } catch (error) {
-                logger.error(`Error during Certificate monitoring job: ${error.message}`);
-            }
-        }, {
-            scheduled: true,
-            timezone: "Asia/Kolkata" // Set your desired timezone
-        });
+        }
     };
 
-    /**
-     * Stops all scheduled monitoring tasks.
-     * This is useful for graceful shutdown or testing.
-     */
-    const stop = () => {
-        if (apiMonitorTask) {
-            apiMonitorTask.stop();
-            logger.info('API monitoring scheduler stopped.');
-        }
-        if (certMonitorTask) {
-            certMonitorTask.stop();
-            logger.info('Certificate monitoring scheduler stopped.');
-        }
-        // Clear any dynamically created intervals if they were implemented differently
-        // for (const urlId in global.monitoringIntervals) {
-        //     clearInterval(global.monitoringIntervals[urlId]);
-        // }
-        // global.monitoringIntervals = {};
-    };
+    // Schedule the task
+    const task = cron.schedule(intervalCron, monitorJob, {
+        scheduled: true,
+        timezone: config.app.timezone // Use timezone from config
+    });
+    scheduledTasks.set(taskKey, task);
+    logger.info(`Scheduled ${type} monitoring for URL ID ${id} (${name}) every ${monitoring_interval_minutes} minutes.`);
 
+    // Trigger an immediate check when scheduling a new or updated active URL
+    // This ensures the dashboard gets immediate status updates.
+    monitorJob(); // Call the job function directly once
+    logger.info(`Triggered immediate check for URL: ${name} (ID: ${id}, Type: ${type}).`);
+};
 
-    /**
-     * Schedules a single URL for immediate check and ensures it's picked up by main cron jobs.
-     * This function is typically called when a URL is added or updated.
-     * It does NOT create new individual cron tasks for each URL.
-     * @param {object} urlObject - The URL object from the database.
-     */
-    async function scheduleMonitor(urlObject) {
-        const { id: urlId, url, type, is_active } = urlObject;
+/**
+ * Stops a monitoring task for a single URL.
+ * @param {number} urlId - The ID of the URL whose task needs to be stopped.
+ */
+const stopMonitor = (urlId) => {
+    // Check both possible task keys (API or DOMAIN) as type might have changed or be unknown
+    const taskKey = `url-${urlId}`; // Consistent key for a URL ID
 
-        if (!is_active) {
-            stopMonitor(urlId); // Ensure it's marked for stop if inactive
-            return;
-        }
-
-        // Trigger an immediate check for the URL
-        logger.info(`Triggering immediate check for URL: ${urlObject.name} (ID: ${urlId}, Type: ${type}).`);
-        if (type === 'API') {
-            await apiMonitorService.checkApiUrlStatus(urlObject);
-        } else if (type === 'DOMAIN') {
-            await certMonitorService.checkCertStatus(urlObject);
-        }
+    if (scheduledTasks.has(taskKey)) {
+        const task = scheduledTasks.get(taskKey);
+        task.stop();
+        scheduledTasks.delete(taskKey);
+        logger.info(`Stopped monitoring for URL ID ${urlId}.`);
+    } else {
+        logger.debug(`No active task found for URL ID ${urlId} to stop.`);
     }
+};
 
-    /**
-     * Marks a URL as stopped for monitoring.
-     * In this setup, individual URLs aren't managed by separate cron tasks.
-     * This function primarily updates the `is_active` status in the DB which the cron jobs respect.
-     * If true per-URL cron tasks were used, this would clear them.
-     * @param {number} urlId - The ID of the URL to stop monitoring.
-     */
-    function stopMonitor(urlId) {
-        logger.info(`Monitoring for URL ID: ${urlId} marked for stop (scheduler will skip if inactive).`);
-        // If you had per-URL cron tasks or intervals:
-        // if (global.monitoringIntervals[urlId]) {
-        //     global.monitoringIntervals[urlId].stop(); // For node-cron tasks
-        //     delete global.monitoringIntervals[urlId];
-        // }
+/**
+ * Restarts a monitoring task for a URL, useful after updates.
+ * @param {object} urlEntry - The updated URL object.
+ */
+const restartMonitor = (urlEntry) => {
+    logger.info(`Restarting monitoring for URL ID ${urlEntry.id} (${urlEntry.name}).`);
+    stopMonitor(urlEntry.id); // Stop existing task
+    if (urlEntry.is_active) {
+        scheduleMonitor(urlEntry); // Schedule new task with updated details if active
+    } else {
+        logger.info(`Monitoring for URL ID ${urlEntry.id} (${urlEntry.name}) is inactive, not restarting.`);
     }
+};
 
-    /**
-     * Restarts monitoring for a specific URL (useful after update).
-     * @param {object} urlObject - The updated URL object.
-     */
-    async function restartMonitor(urlObject) {
-        // A restart is essentially just rescheduling it if it's active
-        if (urlObject.is_active) {
-            await scheduleMonitor(urlObject); // Trigger immediate check
-            logger.info(`Monitoring restarted/scheduled for URL ID: ${urlObject.id} if active.`);
-        } else {
-            stopMonitor(urlObject.id); // Ensure it's stopped if it became inactive
-        }
-    }
+/**
+ * Stops all scheduled monitoring tasks.
+ */
+const stopAll = () => {
+    scheduledTasks.forEach(task => task.stop());
+    scheduledTasks.clear();
+    logger.info('All monitoring tasks stopped.');
+};
 
-    module.exports = {
-        start,
-        stop,
-        scheduleMonitor,
-        restartMonitor
-    };
-    
+
+module.exports = {
+  start,
+  scheduleMonitor,  // <-- Add this line
+  stopMonitor,
+  restartMonitor,
+  stopAll
+};

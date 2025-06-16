@@ -1,27 +1,25 @@
-    // backend/src/routes/monitorRoutes.js
-    const express = require('express');
-    const router = express.Router(); // Ensure router is initialized
-    const monitorController = require('../controllers/monitorController');
-    const authMiddleware = require('../middleware/authMiddleware');
+// backend/src/routes/monitorRoutes.js
+const express = require('express');
+const monitoringController = require('../controllers/monitoringController');
+const { protect } = require('../middleware/authMiddleware'); // ✅ Destructure protect
 
-    // Apply authentication middleware to all monitor routes
-    router.use(authMiddleware.protect);
+const router = express.Router();
 
-    // Routes for URL management
-    router.get('/urls', monitorController.getUrls);
-    router.post('/urls', authMiddleware.restrictTo('admin'), monitorController.addUrl); // Only admin can add URLs
-    router.put('/urls/:id', authMiddleware.restrictTo('admin'), monitorController.updateUrl); // Only admin can update URLs
-    router.delete('/urls/:id', authMiddleware.restrictTo('admin'), monitorController.deleteUrl); // Only admin can delete URLs
+// Apply protection to all routes
+router.use(protect); // ✅ Correct usage
 
-    // Routes for fetching monitoring logs and certificate info (can be accessible to non-admins)
-    router.get('/urls/:id/logs', monitorController.getMonitoringLogs);
-    router.get('/urls/:id/certificate', monitorController.getCertificateInfo);
+// --- URL Monitoring Routes ---
+router.post('/urls', monitoringController.addUrl);
+router.get('/urls', monitoringController.getUrls);
+router.put('/urls/:urlId', monitoringController.updateUrl);
+router.delete('/urls/:urlId', monitoringController.deleteUrl);
+router.get('/urls/:urlId/logs', monitoringController.getMonitoringLogs);
+router.get('/urls/:urlId/certificate', monitoringController.getCertificateInfo);
 
-    // Proxy configuration routes (typically admin only)
-    router.get('/proxy-configs', monitorController.getProxyConfigs);
-    router.post('/proxy-configs', authMiddleware.restrictTo('admin'), monitorController.addProxyConfig);
-    router.put('/proxy-configs/:id', authMiddleware.restrictTo('admin'), monitorController.updateProxyConfig);
-    router.delete('/proxy-configs/:id', authMiddleware.restrictTo('admin'), monitorController.deleteProxyConfig);
+// --- Proxy Configuration Routes ---
+router.post('/proxy-configs', monitoringController.addProxyConfig);
+router.get('/proxy-configs', monitoringController.getProxyConfigs);
+router.put('/proxy-configs/:proxyId', monitoringController.updateProxyConfig);
+router.delete('/proxy-configs/:proxyId', monitoringController.deleteProxyConfig);
 
-    module.exports = router; // Ensure router is exported
-    
+module.exports = router;

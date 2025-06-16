@@ -1,104 +1,83 @@
-    // backend/src/services/apiMonitorService.js
-    const axios = require('axios');
-    const { getDB } = require('../db/connection');
-    const logger = require('../utils/logger');
-    const notificationService = require('./notificationService'); // For sending alerts
-    const https = require('https'); // For custom HTTPS agent if needed
+// backend/src/services/apiMonitorService.js
+const axios = require('axios');
+const { getDB } = require('../db/connection');
+const logger = require('../utils/logger');
+const config = require('../config'); // For timeout config
 
-    /**
-     * Checks the status of an API URL.
-     * Determines 'up' or 'down' based on HTTP status codes (2xx, 3xx, 4xx are up).
-     * @param {object} urlObject - The URL object from the database, including id, url, type, etc.
-     */
-    async function checkApiUrlStatus(urlObject) {
-        const { id: urlId, url, name, user_id, proxy_config_id } = urlObject;
-        let status = 'down'; // Default status
-        let latency = null;
-        let statusCode = null;
-        let error = null;
-        const startTime = process.hrtime.bigint(); // High-resolution time for latency calculation
+/**
+ * Checks the uptime and latency for an API endpoint.
+ * Logs the result and updates the Urls and MonitoringLogs tables.
+ * @param {number} urlId - The ID of the URL being monitored.
+ * @param {string} url - The URL endpoint to check.
+ * @param {object} [proxyConfig=null] - Optional proxy configuration.
+ * @returns {Promise<object>} An object containing status, latency, statusCode, and error.
+ */
+const checkApiUptime = async (urlId, url, proxyConfig = null) => {
+    const db = getDB();
+    let status = 'down'; // Default status
+    let latency = null;
+    let statusCode = null;
+    let error = null;
 
-        try {
-            const axiosConfig = {
-                validateStatus: () => true, // Accept all status codes so we can custom handle them
-                timeout: 15000, // 15-second timeout for API checks
-                headers: {
-                    'User-Agent': 'MonitoringTool/1.0 (API-Monitor)'
-                }
+    try {
+        const start = Date.now();
+        const axiosConfig = {
+            timeout: config.app.apiTimeout, // Use timeout from config (e.g., 10000ms)
+            // Validate all status codes that indicate a response was received (even 4xx, 5xx)
+            // This marks the API as 'up' but captures the specific status code.
+            validateStatus: (status) => true, // Do not throw for any HTTP status code
+        };
+
+        if (proxyConfig && proxyConfig.enabled) {
+            axiosConfig.proxy = {
+                host: proxyConfig.host,
+                port: proxyConfig.port,
+                protocol: proxyConfig.protocol || 'http', // Default to http if not specified
+                ...(proxyConfig.username && { auth: { username: proxyConfig.username, password: proxyConfig.password } })
             };
-
-            // If a proxy is configured, fetch its details and apply to axios config
-            if (proxy_config_id) {
-                const db = getDB();
-                const [proxyConfigs] = await db.execute(
-                    `SELECT host, port, protocol, username, password, enabled FROM ProxyConfigs WHERE id = ?`,
-                    [proxy_config_id]
-                );
-
-                if (proxyConfigs.length > 0 && proxyConfigs[0].enabled) {
-                    const proxy = proxyConfigs[0];
-                    axiosConfig.proxy = {
-                        host: proxy.host,
-                        port: proxy.port,
-                        protocol: proxy.protocol,
-                        auth: (proxy.username && proxy.password) ? { username: proxy.username, password: proxy.password } : undefined
-                    };
-                    logger.debug(`Using proxy ${proxy.host}:${proxy.port} for URL ID ${urlId}`);
-                } else {
-                    logger.warn(`Proxy ID ${proxy_config_id} for URL ID ${urlId} is not found or disabled. Proceeding without proxy.`);
-                }
-            }
-
-            const response = await axios.get(url, axiosConfig);
-            const endTime = process.hrtime.bigint();
-            latency = Number(endTime - startTime) / 1_000_000; // Convert nanoseconds to milliseconds
-            statusCode = response.status;
-
-            // Determine status based on HTTP response code: 2xx, 3xx, 4xx are considered 'up'
-            if (response.status >= 200 && response.status < 500) {
-                status = 'up';
-            } else {
-                status = 'down'; // 5xx or other unexpected HTTP statuses
-                logger.warn(`API ${name} (${url}) returned status ${response.status}. Marking as DOWN.`);
-                error = `HTTP Status: ${response.status}`;
-                notificationService.sendApiDownAlert(user_id, url, `HTTP Status ${response.status}`);
-            }
-
-        } catch (err) {
-            // This catch block handles network errors (e.g., DNS resolution failure, connection refused, timeout)
-            const endTime = process.hrtime.bigint();
-            latency = Number(endTime - startTime) / 1_000_000; // Calculate latency even on error
-            status = 'down';
-            statusCode = err.response ? err.response.status : 0; // Use 0 for network/no response errors
-            error = err.message;
-            logger.error(`Network or unexpected error checking API URL ${url}: ${error.message}`);
-            notificationService.sendApiDownAlert(user_id, url, error); // Send alert for network errors
+            logger.debug(`Using proxy for API check: ${proxyConfig.host}:${proxyConfig.port}`);
         }
 
-        // Update the database with the new status and latency
-        const db = getDB();
+        const response = await axios.get(url, axiosConfig);
+        latency = Date.now() - start;
+        statusCode = response.status;
+        status = 'up'; // API responded, so it's 'up'
+        logger.info(`API ${url} is UP. Status: ${statusCode}, Latency: ${latency}ms`);
+
+    } catch (err) {
+        latency = Date.now() - (start || Date.now()); // Calculate latency even if start wasn't set (unlikely)
+        status = 'down';
+        statusCode = err.response ? err.response.status : (err.code === 'ECONNABORTED' ? 408 : null); // 408 for timeout
+        error = err.message || 'Unknown error during API check.';
+        logger.error(`API ${url} is DOWN. Error: ${error}, Status Code: ${statusCode}, Latency: ${latency}ms`);
+        console.error(`API ${url} check failed:`, err); // Log full error object for debugging
+    } finally {
+        // Update the Urls table with the latest status
         try {
             await db.execute(
                 `UPDATE Urls SET
                     last_status = ?,
+                    last_latency = ?,
                     last_checked_at = NOW(),
-                    last_latency = ?
+                    last_error = ?
                  WHERE id = ?`,
-                [status, latency, urlId]
+                [status, latency, error, urlId]
             );
-            // Also log to MonitoringLogs table for historical data
+        } catch (dbUpdateError) {
+            logger.error(`DB error updating Urls table for API ID ${urlId}: ${dbUpdateError.message}`);
+        }
+
+        // Insert into MonitoringLogs table
+        try {
             await db.execute(
-                `INSERT INTO MonitoringLogs (url_id, status, latency, status_code, error)
-                 VALUES (?, ?, ?, ?, ?)`,
+                `INSERT INTO MonitoringLogs (url_id, status, latency, status_code, error, created_at) VALUES (?, ?, ?, ?, ?, NOW())`,
                 [urlId, status, latency, statusCode, error]
             );
-            logger.info(`API URL ID ${urlId} (${name}) status updated to: ${status}, Latency: ${latency ? latency.toFixed(2) + 'ms' : 'N/A'}, Status Code: ${statusCode || 'N/A'}`);
-        } catch (dbError) {
-            logger.error(`Error updating database for API URL ID ${urlId}: ${dbError.message}`);
+        } catch (dbLogError) {
+            logger.error(`DB error inserting log for API ID ${urlId}: ${dbLogError.message}`);
         }
+        return { status, latency, statusCode, error };
     }
+};
 
-    module.exports = {
-        checkApiUrlStatus
-    };
-    
+module.exports = { checkApiUptime };

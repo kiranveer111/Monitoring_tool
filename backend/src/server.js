@@ -1,46 +1,46 @@
-    // backend/src/server.js
-    const app = require('./app');
-    const { connectDB } = require('./db/connection');
-    const config = require('./config');
-    const logger = require('./utils/logger');
-    const monitoringScheduler = require('./jobs/monitoringScheduler'); // Corrected import to monitoringScheduler.js
+// backend/src/server.js
+const app = require('./app');
+const monitoringScheduler = require('./jobs/monitoringScheduler'); // Corrected variable name
+const { connectDB } = require('./db/connection');
+const config = require('./config');
+const logger = require('./utils/logger'); // Ensure logger is imported
 
-    const PORT = config.app.port;
+const PORT = config.app.port; // Use config.app.port as per config structure
 
-    async function startServer() {
-        try {
-            // Connect to the database first
-            await connectDB();
-            logger.info('Database connected successfully.');
+const startServer = async () => {
+    try {
+        await connectDB(); // Establish database connection
+        logger.info('MySQL Pool created and connected successfully.');
+        logger.info('Database connected successfully.');
 
-            // Start the monitoring jobs after database connection
-            monitoringScheduler.start(); // Call start from the correct scheduler
-            logger.info('Periodic monitoring started.');
+        monitoringScheduler.start(); // Start scheduled monitoring jobs
+        logger.info('Periodic monitoring started.');
 
-            // Start the Express server
-            app.listen(PORT, () => {
-                logger.info(`Server running on port ${PORT} in ${config.app.env} mode.`);
-            });
-        } catch (error) {
-            logger.error(`Failed to start server: ${error.message}`);
-            // Exit process with failure code
-            process.exit(1);
-        }
+        app.listen(PORT, () => {
+            logger.info(`Server running on port ${PORT} in ${config.app.env} mode.`);
+        });
+    } catch (error) {
+        logger.error(`Failed to start server: ${error.message}`);
+        console.error(`Failed to start server:`, error); // Log full error for debugging
+        process.exit(1);
     }
 
-    startServer();
-
     // Handle unhandled promise rejections
-    process.on('unhandledRejection', (err, promise) => {
-        logger.error(`Unhandled Rejection: ${err.message}`, err);
-        // Optionally: close server and exit process
-        // server.close(() => process.exit(1));
+    process.on('unhandledRejection', (reason, promise) => {
+        logger.error(`Unhandled Rejection: ${reason.message || reason}`);
+        console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+        // Optionally, exit the process after a grace period or if it's a critical error
+        // For development, just log and keep running to allow inspection.
+        // For production, consider process.exit(1) after a short delay.
     });
 
     // Handle uncaught exceptions
     process.on('uncaughtException', (err) => {
-        logger.fatal(`Uncaught Exception: ${err.message}`, err);
-        // Optionally: close server and exit process
-        // server.close(() => process.exit(1));
+        logger.error(`uncaughtException: ${err.message}`);
+        console.error('Uncaught Exception:', err);
+        // On uncaught exception, exit the process.
+        process.exit(1);
     });
-    
+};
+
+startServer();

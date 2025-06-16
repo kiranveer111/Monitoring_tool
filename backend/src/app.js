@@ -4,7 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const authRoutes = require('./routes/authRoutes');
-const monitorRoutes = require('./routes/monitorRoutes'); // Changed from monitoringRoutes to monitorRoutes
+const monitorRoutes = require('./routes/monitorRoutes'); // Corrected import to monitorRoutes
 const alertRoutes = require('./routes/alertRoutes');
 const { errorHandler } = require('./middleware/errorHandler'); // Corrected import: Destructure errorHandler
 const AppError = require('./utils/appError'); // Make sure AppError is available for routes/controllers if they use next(new AppError)
@@ -20,7 +20,7 @@ app.use(morgan('dev')); // HTTP request logger
 
 // Routes
 app.use('/api/auth', authRoutes);
-app.use('/api/monitor', monitorRoutes); // Changed from monitoringRoutes to monitorRoutes
+app.use('/api/monitor', monitorRoutes); // Corrected usage to monitorRoutes
 app.use('/api/alerts', alertRoutes);
 
 // Health check endpoint

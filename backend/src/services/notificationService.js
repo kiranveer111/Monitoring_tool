@@ -6,12 +6,10 @@ const logger = require('../utils/logger');
 const { getDB } = require('../db/connection'); // To fetch user-specific alert configs
 
 // Nodemailer Transporter Setup
-// This transporter is created once when the service is loaded.
-// It uses configurations from the central config.
 const transporter = nodemailer.createTransport({
     host: config.email.host,
     port: config.email.port,
-    secure: config.email.secure, // Use TLS (true for 465, false for 587)
+    secure: config.email.secure, // Use TLS (true for 465, false for other ports like 587)
     auth: {
         user: config.email.user,
         pass: config.email.pass,
@@ -27,8 +25,8 @@ const transporter = nodemailer.createTransport({
  * @returns {Promise<void>}
  */
 const sendEmail = async (to, subject, text, html) => {
-    if (!to || !config.email.user || !config.email.pass) {
-        logger.warn('Email sending skipped: recipient, sender email, or password not configured.');
+    if (!to || !config.email.user || !config.email.pass || !config.email.host) { // Added host check
+        logger.warn('Email sending skipped: recipient, sender email, password, or host not configured.');
         return;
     }
     try {
@@ -43,7 +41,7 @@ const sendEmail = async (to, subject, text, html) => {
     } catch (error) {
         logger.error(`Failed to send email to ${to} for subject "${subject}": ${error.message}`);
         // Log sensitive error details only in development
-        if (config.app.env === 'development') { // Corrected from config.nodeEnv to config.app.env
+        if (config.app.env === 'development') { // Use config.app.env as per config structure
             logger.error(`Nodemailer error details: ${JSON.stringify(error)}`);
         }
     }
@@ -59,8 +57,13 @@ const sendEmail = async (to, subject, text, html) => {
  * @returns {void} (Not a Promise, as it's a fire-and-forget for traps)
  */
 const sendSnmpTrap = (receiverHost, community, oid, value, type = snmp.ObjectType.OctetString) => {
-    if (!receiverHost || !community || !oid) {
-        logger.warn('SNMP trap sending skipped: receiver host, community, or OID not configured.');
+    // Validate OID format
+    if (!oid || typeof oid !== 'string' || !/^(\.\d+)+$/.test(oid)) {
+        logger.warn(`SNMP trap sending skipped: Invalid OID string provided: '${oid}'. Must be dot-separated numbers (e.g., .1.3.6.1.4.1.9999.1.1).`);
+        return;
+    }
+    if (!receiverHost || !community) {
+        logger.warn('SNMP trap sending skipped: receiver host or community not configured.');
         return;
     }
 
@@ -73,12 +76,17 @@ const sendSnmpTrap = (receiverHost, community, oid, value, type = snmp.ObjectTyp
     // Create a new SNMP session for each trap to ensure proper closing
     const snmpSession = snmp.createSession(
         receiverHost,
-        community
+        community,
+        { timeout: 5000 } // Add a timeout for SNMP sessions
     );
 
     snmpSession.trap(snmp.TrapType.LinkUp, varbinds, (error) => {
         if (error) {
             logger.error(`Failed to send SNMP trap to ${receiverHost} with OID ${oid}: ${error.message}`);
+            // Log sensitive error details only in development
+            if (config.app.env === 'development') {
+                logger.error(`SNMP error details: ${JSON.stringify(error)}`);
+            }
         } else {
             logger.info(`SNMP trap sent to ${receiverHost} for OID: ${oid}`);
         }
